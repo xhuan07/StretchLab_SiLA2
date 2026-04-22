@@ -1,0 +1,35 @@
+{
+  "sila_server": {
+    "hostname": "0.0.0.0",
+    "port": 50053,
+    "tls": false,
+    "require_client_auth": false,
+    "root_certificates": null,
+    "certificate_chain": null,
+    "private_key": null,
+    "options": {},
+    "uuid": "3a244469-9607-4d49-8f19-3d0e1847d628",
+    "name": "Keysight 34465A",
+    "type": "Device",
+    "description": "SiLA connector for Keysight 34465A DMM.",
+    "version": "0.1",
+    "vendor_url": "https://www.keysight.com/",
+    "default_lifetime": 3600.0
+  },
+  "cloud_server_endpoint": {
+    "hostname": "localhost",
+    "port": 50000,
+    "tls": true,
+    "root_certificates": null,
+    "certificate_chain": null,
+    "private_key": null,
+    "reconnect_delay": 10000.0,
+    "options": {}
+  },
+  "discovery": {
+    "ip_version": "ipv4",
+    "network_interfaces": ["eth0"]
+  },
+  "logging": null,
+  "visa_resource": "USB0::0x2A8D::0x0101::MY54504800::INSTR"
+}

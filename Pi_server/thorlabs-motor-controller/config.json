@@ -1,0 +1,34 @@
+{
+  "sila_server": {
+    "hostname": "0.0.0.0",
+    "port": 50052,
+    "tls": false,
+    "require_client_auth": false,
+    "root_certificates": null,
+    "certificate_chain": null,
+    "private_key": null,
+    "options": {},
+    "uuid": "1ca5fa1d-a2ff-4483-b4cb-2e87f8a02022",
+    "name": "thorlabs motor controller",
+    "type": "Example",
+    "description": "A connector for the thorlabs motor controller built with the UniteLabs CDK.",
+    "version": "0.1",
+    "vendor_url": "https://unitelabs.io/",
+    "default_lifetime": 3600.0
+  },
+  "cloud_server_endpoint": {
+    "hostname": "localhost",
+    "port": 50000,
+    "tls": true,
+    "root_certificates": null,
+    "certificate_chain": null,
+    "private_key": null,
+    "reconnect_delay": 10000.0,
+    "options": {}
+  },
+  "discovery": {
+    "ip_version": "ipv4",
+    "network_interfaces": ["eth0"]
+  },
+  "logging": null
+}
