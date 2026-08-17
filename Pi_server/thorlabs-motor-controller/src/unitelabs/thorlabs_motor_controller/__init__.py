@@ -1,6 +1,7 @@
 import ctypes
 import dataclasses
 import collections.abc
+import os
 from importlib.metadata import version
 
 from unitelabs.cdk import Connector, ConnectorBaseConfig, SiLAServerConfig
@@ -20,9 +21,10 @@ class ThorlabsMotorControllerConfig(ConnectorBaseConfig):
             description="SiLA connector for Thorlabs KDC101 motor stage.",
             version=str(__version__),
             vendor_url="https://www.thorlabs.com/",
+            port=int(os.environ.get("MOTOR_PORT", "50051")),
         )
     )
-    serial_number: str = "27001592"
+    serial_number: str = os.environ.get("MOTOR_SERIAL", "27001592")
     stage_model: str = "MTS50-Z8"
 
 
