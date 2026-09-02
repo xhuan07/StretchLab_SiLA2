@@ -8,6 +8,7 @@ Created on Sat Feb 21 15:59:20 2026
 import sys
 import os
 import cv2
+import numpy as np
 #import locale
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QDoubleSpinBox, 
@@ -20,6 +21,7 @@ utils.load_settings()
 from PyQt5.QtGui import QIcon, QImage, QPixmap
 
 from motor_threads import ConnectThread, MoveThread, HomeThread
+from motor_panel import MotorPanel
 from automation_threads import AutomationThread
 from camera_control import CameraController, CameraThread
 #from smu_control import SMUController
@@ -28,6 +30,11 @@ from dmm_control import DMMController
 from dmm_threads import DMMThread
 from image_saver import save_frame
 from scan_logger import append_scan_log
+
+# --- Motor endpoints (each motor = one SiLA server on the Pi) ---
+MOTOR_HOST = "192.168.10.2"
+MOTOR1_PORT = 50051   # automation and camera logging follow Motor 1
+MOTOR2_PORT = 50052
 
 
 # =============================================================================
@@ -62,7 +69,7 @@ class HardwareConnectDialog(QDialog):
         
         self.hw_combo = QComboBox()
         # Updated to reflect multi-protocol support
-        self.hw_combo.addItems(["Thorlabs Motor (KDC101)", "Live Camera (OpenCV/Vimba)"])
+        self.hw_combo.addItems(["Thorlabs Motor (KDC101)", "Live Camera (OpenCV/Vimba/Lumenera)"])
         self.hw_combo.currentIndexChanged.connect(self._toggle_inputs)
         layout.addWidget(self.hw_combo)
 
@@ -131,7 +138,7 @@ class HardwareConnectDialog(QDialog):
             self.hw_combo.setVisible(False)
         elif self.lock_mode == "Camera":
             # Updated to match the string in the dropdown
-            self.hw_combo.setCurrentText("Live Camera (OpenCV/Vimba)")
+            self.hw_combo.setCurrentText("Live Camera (OpenCV/Vimba/Lumenera)")
             self.combo_label.setVisible(False)
             self.hw_combo.setVisible(False)
 
@@ -180,43 +187,31 @@ class HardwareConnectDialog(QDialog):
 
 class AutomatedScanDialog(QDialog):
     """
-    Dialog for configuring the Step-and-Shoot automated scan.
-    Collects parameters for motion, delays, and image saving paths.
+    Two-motor Step-and-Shoot retreat scan setup.
+    Both motors retreat toward 0. Each step shortens the system by the step
+    size, with each motor moving half of it. Input is checked so no motor is
+    driven below 0.
     """
-    def __init__(self, parent=None, current_pos=0.0):
+    def __init__(self, parent=None, pos1=0.0, pos2=0.0):
         super().__init__(parent)
         self.setWindowTitle("Automated Strain Mapping Setup")
-        self.setFixedSize(550, 400)
-        self.current_pos = current_pos
+        self.setFixedSize(560, 380)
+        self.pos1 = pos1
+        self.pos2 = pos2
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout()
         self.setLocale(QLocale(QLocale.C))
-        
-        # --- 1. Motion Parameters Group ---
-        motion_group = QGroupBox("Motion Parameters")
-        motion_layout = QFormLayout()
-        start_layout = QHBoxLayout()
-        self.start_pos = QDoubleSpinBox()
-        self.start_pos.setRange(0.0, 50.0)
-        self.start_pos.setDecimals(3)
-        self.start_pos.setSingleStep(0.1)
-        self.start_pos.setValue(self.current_pos) # Default to current hardware position
-        
-        self.btn_read_current = QPushButton("Read Current")
-        self.btn_read_current.setToolTip("Fetch the real-time position from the motor hardware")
-        self.btn_read_current.clicked.connect(self._fetch_hardware_position)
 
-        start_layout.addWidget(self.start_pos)
-        start_layout.addWidget(self.btn_read_current)
-        
-        
-        self.end_pos = QDoubleSpinBox()
-        self.end_pos.setRange(0.0, 50.0)
-        self.end_pos.setDecimals(3)
-        self.end_pos.setSingleStep(0.1)
-        self.end_pos.setValue(self.current_pos + 5.0) # Suggest a 5mm stretch
+        motion_group = QGroupBox("Motion Parameters (both motors retreat toward 0)")
+        motion_layout = QFormLayout()
+
+        self.distance = QDoubleSpinBox()
+        self.distance.setRange(0.001, 50.0)
+        self.distance.setDecimals(3)
+        self.distance.setSingleStep(0.1)
+        self.distance.setValue(5.0)
 
         self.step_size = QDoubleSpinBox()
         self.step_size.setRange(0.001, 10.0)
@@ -228,21 +223,21 @@ class AutomatedScanDialog(QDialog):
         self.settle_time.setRange(0.0, 60.0)
         self.settle_time.setSingleStep(0.5)
         self.settle_time.setValue(2.0)
-        self.settle_time.setSuffix(" sec") # Add unit suffix for clarity
+        self.settle_time.setSuffix(" sec")
 
-        motion_layout.addRow("Start Position (mm):", start_layout)
-        motion_layout.addRow("End Position (mm):", self.end_pos)
+        cur_label = QLabel(f"Motor 1: {self.pos1:.3f} mm     Motor 2: {self.pos2:.3f} mm")
+        cur_label.setStyleSheet("color: gray;")
+
+        motion_layout.addRow("Relative Distance (mm):", self.distance)
         motion_layout.addRow("Step Size (mm):", self.step_size)
         motion_layout.addRow("Settling Delay:", self.settle_time)
+        motion_layout.addRow("Current positions:", cur_label)
         motion_group.setLayout(motion_layout)
         layout.addWidget(motion_group)
 
-        # --- 2. Storage Settings Group ---
         storage_group = QGroupBox("Storage Settings")
         storage_layout = QFormLayout()
-
         self.prefix_input = QLineEdit("Sample_Test")
-
         dir_layout = QHBoxLayout()
         self.dir_input = QLineEdit()
         self.dir_input.setReadOnly(True)
@@ -250,22 +245,18 @@ class AutomatedScanDialog(QDialog):
         self.btn_browse.clicked.connect(self._browse_dir)
         dir_layout.addWidget(self.dir_input)
         dir_layout.addWidget(self.btn_browse)
-
         storage_layout.addRow("File Prefix:", self.prefix_input)
         storage_layout.addRow("Save To:", dir_layout)
         storage_group.setLayout(storage_layout)
         layout.addWidget(storage_group)
 
-        # --- 3. Action Buttons ---
         btn_layout = QHBoxLayout()
         self.btn_start = QPushButton("Start Scan")
         self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
         self.btn_start.clicked.connect(self._validate_and_accept)
-
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setStyleSheet("padding: 8px;")
         self.btn_cancel.clicked.connect(self.reject)
-
         btn_layout.addWidget(self.btn_start)
         btn_layout.addWidget(self.btn_cancel)
         layout.addLayout(btn_layout)
@@ -273,54 +264,42 @@ class AutomatedScanDialog(QDialog):
         self.setLayout(layout)
 
     def _browse_dir(self):
-        """ Opens a dialog to select the output directory for images. """
         directory = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if directory:
             self.dir_input.setText(directory)
 
     def _validate_and_accept(self):
-        """ Validates user input before closing and accepting the dialog. """
         if not self.dir_input.text():
             QMessageBox.warning(self, "Validation Error", "Please select a directory to save images.")
             return
         if self.step_size.value() <= 0:
             QMessageBox.warning(self, "Validation Error", "Step size must be greater than zero.")
             return
-        if self.start_pos.value() == self.end_pos.value():
-            QMessageBox.warning(self, "Validation Error", "Start and End positions cannot be the same.")
+        dist = self.distance.value()
+        if dist <= 0:
+            QMessageBox.warning(self, "Validation Error", "Relative distance must be greater than zero.")
             return
-
+        # Each motor retreats dist/2 toward 0; neither may go below 0.
+        half = dist / 2.0
+        min_pos = min(self.pos1, self.pos2)
+        if min_pos - half < 0:
+            max_dist = 2.0 * min_pos
+            QMessageBox.warning(
+                self, "Validation Error",
+                f"Distance too large. Each motor would retreat {half:.3f} mm and pass 0.\n"
+                f"Maximum distance from the current positions is {max_dist:.3f} mm.")
+            return
         self.accept()
 
     def get_parameters(self):
-        """ Returns a dictionary of the configured parameters for the thread. """
         return {
-            "start_pos": self.start_pos.value(),
-            "end_pos": self.end_pos.value(),
+            "distance": self.distance.value(),
             "step_size": self.step_size.value(),
             "settle_time": self.settle_time.value(),
             "prefix": self.prefix_input.text(),
             "directory": self.dir_input.text()
         }
-    def _fetch_hardware_position(self):
-        """
-        Dynamically queries the motor for its exact current position
-        and updates the Start Position spinbox.
-        """
-        # Access the parent GUI's stage object safely
-        parent_gui = self.parent()
-        if parent_gui and hasattr(parent_gui, 'stage') and parent_gui.stage:
-            try:
-                # Query the hardware
-                real_time_pos = parent_gui.stage.get_position()
-                self.start_pos.setValue(real_time_pos)
-                
-                # Optional: Auto-shift the End Position to maintain the stretch distance
-                # (e.g., if you read a new start, end automatically becomes start + 5mm)
-                self.end_pos.setValue(real_time_pos + 5.0) 
-            except Exception as e:
-                QMessageBox.warning(self, "Hardware Error", f"Failed to read position: {e}")
-    
+
 class ScanProgressDialog(QDialog):
     """
     A blocking modal dialog that shows real-time progress of the automated scan.
@@ -368,7 +347,14 @@ class StretchLabGUI(QMainWindow):
         super().__init__()
         self.camera_controller = CameraController() 
         self.camera_thread = None
-        self.initUI()      
+        self.initUI()
+
+    @property
+    def stage(self):
+        """Compatibility shim: automation and camera logging read
+        Motor 1's controller through self.stage."""
+        return self.motor1.stage if hasattr(self, 'motor1') else None
+
     def initUI(self):
 
 
@@ -384,7 +370,6 @@ class StretchLabGUI(QMainWindow):
         # Setup Main Window
         self.setWindowTitle("StretchLab Control Station")
         self.setGeometry(100, 100, 1000, 600) 
-        self.stage = None
         #self.smu_controller = SMUController() 
         #self.smu_thread = None
         self.dmm_controller = DMMController() 
@@ -400,8 +385,21 @@ class StretchLabGUI(QMainWindow):
 
         main_layout.addWidget(self._create_camera_panel(), stretch=2) 
         right_layout = QVBoxLayout()
-        right_layout.addWidget(self._create_control_panel())
-        #right_layout.addWidget(self._create_smu_panel())
+
+        # --- Two independent motor panels ---
+        motors_row = QHBoxLayout()
+        self.motor1 = MotorPanel("Motor 1", host=MOTOR_HOST, port=MOTOR1_PORT)
+        self.motor2 = MotorPanel("Motor 2", host=MOTOR_HOST, port=MOTOR2_PORT)
+        motors_row.addWidget(self.motor1)
+        motors_row.addWidget(self.motor2)
+        right_layout.addLayout(motors_row)
+
+        # --- Global emergency stop (both motors) ---
+        self.btn_estop_all = QPushButton("EMERGENCY STOP (ALL)")
+        self.btn_estop_all.setStyleSheet("background-color: red; color: white; font-weight: bold; padding: 10px;")
+        self.btn_estop_all.clicked.connect(self._emergency_stop)
+        right_layout.addWidget(self.btn_estop_all)
+
         right_layout.addWidget(self._create_dmm_panel())
         main_layout.addLayout(right_layout, stretch=1)
 
@@ -435,25 +433,28 @@ class StretchLabGUI(QMainWindow):
 
     def _open_scan_dialog(self):
         """ Opens the config dialog, and if accepted, launches the automated thread. """
-        if self.stage is None or not getattr(self, 'camera_thread', None) or not self.camera_thread.isRunning():
-            QMessageBox.warning(self, "Hardware Not Ready", "Please connect BOTH the Motor and the Camera before starting an automated scan.")
+        cam_ok = getattr(self, 'camera_thread', None) and self.camera_thread.isRunning()
+        if self.motor1.stage is None or self.motor2.stage is None or not cam_ok:
+            QMessageBox.warning(self, "Hardware Not Ready", "Please connect BOTH motors and the camera before starting an automated scan.")
             return
 
-        current_pos = self.stage.get_position() if self.stage else 0.0
-        dialog = AutomatedScanDialog(self, current_pos=current_pos)
+        pos1 = self.motor1.stage.get_position()
+        pos2 = self.motor2.stage.get_position()
+        dialog = AutomatedScanDialog(self, pos1=pos1, pos2=pos2)
         
         if dialog.exec_() == QDialog.Accepted:
             params = dialog.get_parameters()
             
             # 1. Lock UI to prevent interference
             self.scan_action.setEnabled(False)
-            self.btn_toggle_conn.setEnabled(False)
+            self.motor1.btn_toggle_conn.setEnabled(False)
+            self.motor2.btn_toggle_conn.setEnabled(False)
             
             # 2. Create the Progress Dialog (Modal)
             self.progress_dialog = ScanProgressDialog(self)
             
             # 3. Initialize the Automation Thread
-            self.auto_thread = AutomationThread(self.stage, params)
+            self.auto_thread = AutomationThread(self.motor1.stage, self.motor2.stage, params)
             
             # Connect Signals
             self.auto_thread.progress_update.connect(self.progress_dialog.update_progress)
@@ -468,7 +469,7 @@ class StretchLabGUI(QMainWindow):
             self.progress_dialog.exec_() # Block main window while scanning
 
 
-    def _execute_automated_capture(self, file_path):
+    def _execute_automated_capture(self, file_path, cumulative):
         # 1. 测电阻
         resistance_raw, resistance_str = None, "N/A"
         if self.dmm_controller.dmm is not None:
@@ -482,10 +483,10 @@ class StretchLabGUI(QMainWindow):
             print("[Automation Error] Frame buffer empty!")
 
         # 3. 写 CSV
-        if resistance_raw is not None and self.stage is not None:
+        if resistance_raw is not None:
             append_scan_log(
                 os.path.join(os.path.dirname(file_path), "scan_log.csv"),
-                self.stage.get_position(),
+                cumulative,
                 resistance_raw, resistance_str,
                 os.path.basename(file_path)
                 )
@@ -503,7 +504,8 @@ class StretchLabGUI(QMainWindow):
 
         # Re-enable UI
         self.scan_action.setEnabled(True)
-        self.btn_toggle_conn.setEnabled(True)
+        self.motor1.btn_toggle_conn.setEnabled(True)
+        self.motor2.btn_toggle_conn.setEnabled(True)
 
         # Show final result
         if success:
@@ -511,8 +513,10 @@ class StretchLabGUI(QMainWindow):
         else:
             QMessageBox.warning(self, "Scan Aborted", message)
             # Sync the UI display position in case of an abrupt stop
-            if self.stage:
-                self._update_pos_ui(self.stage.get_position())
+            if self.motor1.stage:
+                self.motor1._update_pos(self.motor1.stage.get_position())
+            if self.motor2.stage:
+                self.motor2._update_pos(self.motor2.stage.get_position())
             
     def _create_camera_panel(self):
         from PyQt5.QtWidgets import QSlider # 确保顶部导入了 QSlider
@@ -578,124 +582,6 @@ class StretchLabGUI(QMainWindow):
         group_box.setLayout(layout)
         return group_box
 
-    def _create_control_panel(self):
-        group_box = QGroupBox("MTS50-Z8 Motor Control")
-        layout = QVBoxLayout()
-
-        # 1. Status Display
-        self.status_display = QLabel("Status: Disconnected")
-        self.status_display.setStyleSheet("font-size: 16px; font-weight: bold; color: gray;")
-        layout.addWidget(self.status_display)
-
-        # 2. Position Display
-        self.pos_display = QLabel("Current Position: -- mm")
-        self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: gray;")
-        layout.addWidget(self.pos_display)
-
-        # 3. Velocity Display
-        self.vel_display = QLabel("Current Velocity: -- mm/s")
-        self.vel_display.setStyleSheet("font-size: 16px; font-weight: bold; color: gray;")
-        layout.addWidget(self.vel_display)
-        
-        layout.addSpacing(15) # Add a little gap before the input boxes
-
-        # ==========================================
-        # GROUP 1: Velocity Control 
-        # ==========================================
-        vel_layout = QHBoxLayout()
-        vel_layout.addWidget(QLabel("Stretch Velocity (mm/s):"))
-        
-        self.vel_input = QDoubleSpinBox()
-        self.vel_input.setRange(0.001, 2.400) 
-        self.vel_input.setDecimals(3)
-        self.vel_input.setValue(config.DEFAULT_VELOCITY) 
-        self.vel_input.setSingleStep(0.1)
-        vel_layout.addWidget(self.vel_input)
-
-        # --- NEW: Dedicated Set Velocity Button ---
-        self.btn_set_vel = QPushButton("Set Velocity")
-        self.btn_set_vel.setEnabled(False) # Disabled until connected
-        self.btn_set_vel.clicked.connect(self._set_velocity_clicked)
-        vel_layout.addWidget(self.btn_set_vel)
-        
-        layout.addLayout(vel_layout)
-        
-        layout.addSpacing(10) # Add a visual gap between the two groups
-
-        # ==========================================
-        # GROUP 2: Position Control
-        # ==========================================
-        pos_layout = QHBoxLayout()
-        pos_layout.addWidget(QLabel("Target Position (mm):"))
-        
-        self.target_input = QDoubleSpinBox()
-        self.target_input.setRange(0.0, 50.0) 
-        self.target_input.setDecimals(3)
-        self.target_input.setSingleStep(0.1)
-        self.target_input.setValue(10.0)
-        self.target_input.setSingleStep(1.0)
-        pos_layout.addWidget(self.target_input)
-
-        # Move Button (Added ONLY to the horizontal layout)
-        self.btn_move = QPushButton("Move to Target")
-        self.btn_move.setEnabled(False) 
-        self.btn_move.clicked.connect(self._start_moving_absolute)
-        pos_layout.addWidget(self.btn_move)
-        
-        layout.addLayout(pos_layout)
-        layout.addSpacing(10)
-        rel_layout = QHBoxLayout()
-        rel_layout.addWidget(QLabel("Relative Dist (mm):"))
-        
-        self.rel_input = QDoubleSpinBox()
-        self.rel_input.setRange(-50.0, 50.0) # 注意：这里必须允许负数！
-        self.rel_input.setDecimals(3)
-        self.rel_input.setSingleStep(0.1)
-        self.rel_input.setValue(1.0) # 默认相对移动 1mm
-        rel_layout.addWidget(self.rel_input)
-
-        self.btn_move_rel = QPushButton("Move By Dist")
-        self.btn_move_rel.setEnabled(False) 
-        self.btn_move_rel.clicked.connect(self._start_moving_relative) # 绑定相对移动函数
-        rel_layout.addWidget(self.btn_move_rel)
-        
-        layout.addLayout(rel_layout)
-        
-        # Add a visual separator spacing before global actions
-        layout.addSpacing(15)
-
-        # ==========================================
-        # GROUP 3: Global Action Buttons
-        # ==========================================
-        
-        # 1. Smart Toggle Connection Button
-        self.btn_toggle_conn = QPushButton("Connect Hardware")
-        self.btn_toggle_conn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        self.btn_toggle_conn.clicked.connect(self._toggle_connection)
-        layout.addWidget(self.btn_toggle_conn)
-
-        # 2. Home Device Button
-        self.btn_home = QPushButton("Home Device")    
-        self.btn_home.setEnabled(False)
-        self.btn_home.clicked.connect(self._start_homing)
-        layout.addWidget(self.btn_home)
-        
-        # Add extra spacing to isolate the Emergency Stop button
-        layout.addSpacing(25) 
-        
-        # 3. Emergency Stop Button
-        self.btn_stop = QPushButton("EMERGENCY STOP")
-        self.btn_stop.setStyleSheet("background-color: red; color: white; font-weight: bold; padding: 10px;")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self._emergency_stop)
-        layout.addWidget(self.btn_stop)
-
-        # Push everything upwards
-        layout.addStretch()
-        
-        group_box.setLayout(layout)
-        return group_box
-    
  #   def _create_smu_panel(self):
  #       """ Creates the UI panel for the Keithley 2450 SourceMeter. """
  #       group_box = QGroupBox("Keithley 2450 SourceMeter")
@@ -740,12 +626,6 @@ class StretchLabGUI(QMainWindow):
  #       group_box.setLayout(layout)
  #      return group_box
 
-    def _toggle_connection(self):
-        """Right Button: Jumps directly to Motor dialog."""
-        if self.stage is None:
-            self._open_connection_dialog(lock_mode="Motor")
-        else:
-            self._disconnect_device()
     def _create_dmm_panel(self):
         """ Creates the UI panel for the Keysight 34465A DMM. """
         group_box = QGroupBox("Keysight 34465A DMM")
@@ -792,68 +672,20 @@ class StretchLabGUI(QMainWindow):
         group_box.setLayout(layout)
         return group_box
     def _open_connection_dialog(self, lock_mode=None):
-        """Opens dialog. Menu uses None, UI buttons use locked modes."""
-        if lock_mode == "Motor" and self.stage is not None:
-            print("[System] Closing existing motor connection before re-connecting...")
-            self.stage.disconnect() 
-            self.stage = None 
-            
+        """Camera connection setup. Motors connect from their own panels."""
         dialog = HardwareConnectDialog(self, lock_mode=lock_mode)
-        
+
         if dialog.exec_() == QDialog.Accepted:
             hw_type = dialog.selected_hardware
-            
             if "Motor" in hw_type:
-                sn_to_use = dialog.entered_sn
-                model_to_use = dialog.selected_model 
-                
-                self.pos_display.setText(f"Status: Connecting to {model_to_use}...")
-                self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: orange;")
-                
-                self.conn_thread = ConnectThread(sn_to_use, model_to_use)
-                self.conn_thread.finished.connect(self._on_connection_result)
-                self.conn_thread.start()
-                
+                QMessageBox.information(self, "Motor Connection",
+                                        "Connect each motor from its own panel "
+                                        "using the 'Connect Motor' button.")
             elif "Camera" in hw_type:
-                # Ensure the new ID is passed to config memory before thread starts
                 config.CAMERA_ID = dialog.entered_cam_id
                 print(f"[System] Initiating camera connection with ID: {config.CAMERA_ID}...")
                 self._connect_camera()
 
-    def _disconnect_device(self):
-        """Safely disconnects the MOTOR hardware and resets the UI state."""
-        if self.stage is not None:
-            print("[System] Disconnecting motor...")
-            self.stage.disconnect() 
-            self.stage = None
-            
-            # 1. Reset Status
-            self.status_display.setText("Status: Disconnected")
-            self.status_display.setStyleSheet("font-size: 16px; font-weight: bold; color: gray;")
-            
-            # 2. Reset Position
-            self.pos_display.setText("Current Position: -- mm")
-            self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: gray;")
-            
-            # 3. Reset Velocity
-            self.vel_display.setText("Current Velocity: -- mm/s")
-            self.vel_display.setStyleSheet("font-size: 16px; font-weight: bold; color: gray;")
-            
-            # Disable hardware buttons
-            self.btn_move.setEnabled(False)
-            self.btn_home.setEnabled(False)
-            self.btn_stop.setEnabled(False)
-            self.btn_set_vel.setEnabled(False)
-            
-            # Revert the toggle button back to Connect mode (Green)
-            self.btn_toggle_conn.setText("Connect Hardware")
-            self.btn_toggle_conn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-            
-            if hasattr(self, 'disconnect_action'):
-                self.disconnect_action.setEnabled(False)
-            
-            QMessageBox.information(self, "Disconnected", "Motor has been safely disconnected.")
-    
     # =============================================================================
     # [CAMERA CONTROL LOGIC]
     # =============================================================================
@@ -901,6 +733,14 @@ class StretchLabGUI(QMainWindow):
                 self.exp_slider.setValue(10000)
                 self.gain_slider.setRange(0, 240)
                 self.gain_slider.setValue(0)
+            elif self.camera_controller.camera_type == 'LUC':
+                # Lumenera INFINITY: exposure 0.064 ~ 394.24 ms, gain 1.0 ~ 7.75x
+                # Slider uses x100 for 0.01ms precision
+                self.exp_slider.setRange(6, 39424)  # 0.06ms ~ 394.24ms
+                self.exp_slider.setValue(400)  # Default 4ms
+                
+                self.gain_slider.setRange(10, 78)  # 1.0x ~ 7.8x (x10)
+                self.gain_slider.setValue(10)  # Default 1.0x
             # ------------------------------------------
 
             self.btn_toggle_cam.setText("Disconnect Camera")
@@ -966,6 +806,7 @@ class StretchLabGUI(QMainWindow):
         """
         Slot function called every time the background thread emits a new frame.
         Handles UI freezing, raw frame buffering, and dynamic format conversion.
+        Supports 8-bit and 16-bit (Lumenera) inputs.
         """
         # 1. THE GATEKEEPER: Stop updating the UI if the stream is paused
         if getattr(self, 'is_frozen', False):
@@ -974,32 +815,35 @@ class StretchLabGUI(QMainWindow):
         # 2. THE RAW BUFFER: Save the original, unscaled numpy array for high-res saving
         self._current_raw_frame = cv_img.copy()
 
-        # 3. UI RENDERING: Convert the numpy array to a QPixmap safely
+        # 3. BIT-DEPTH NORMALIZATION: Convert 16-bit to 8-bit for display only
+        display_img = cv_img
+        if cv_img.dtype == np.uint16:
+            # Shift 12-bit sensor data (0-4095) down to 8-bit (0-255)
+            display_img = (cv_img >> 4).astype(np.uint8)
+        elif cv_img.dtype != np.uint8:
+            display_img = cv_img.astype(np.uint8)
+
+        # 4. UI RENDERING: Convert the numpy array to a QPixmap safely
         try:
-            shape = cv_img.shape
+            shape = display_img.shape
             
             if len(shape) == 3:
                 h, w, ch = shape
                 if ch == 1:
-                    # Grayscale image with shape (H, W, 1)
                     bytes_per_line = w
-                    q_img = QImage(cv_img.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+                    q_img = QImage(display_img.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
                 else:
-                    # Color image with shape (H, W, 3)
                     bytes_per_line = ch * w
-                    # Convert BGR (OpenCV default) to RGB (Qt default)
-                    cv_img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+                    cv_img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
                     q_img = QImage(cv_img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
             elif len(shape) == 2:
-                # Pure 2D Grayscale image with shape (H, W)
                 h, w = shape
                 bytes_per_line = w
-                q_img = QImage(cv_img.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+                q_img = QImage(display_img.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
             else:
-                # Unrecognized format, ignore to prevent crashes
                 return 
 
-            # 4. SCALE AND DISPLAY: Fit the image perfectly into the UI label
+            # 5. SCALE AND DISPLAY: Fit the image perfectly into the UI label
             pixmap = QPixmap.fromImage(q_img)
             self.camera_label.setPixmap(pixmap.scaled(
                 self.camera_label.width(), 
@@ -1040,208 +884,36 @@ class StretchLabGUI(QMainWindow):
             self.exp_val_label.setText(f"{value} µs")
             self.camera_controller.set_exposure(value)
 
+        elif self.camera_controller.camera_type == 'LUC':
+            # LuCam: slider value is ms * 100, actual exposure is in ms
+            actual_ms = value / 100.0
+            self.exp_val_label.setText(f"{actual_ms:.2f} ms")
+            self.camera_controller.set_exposure(actual_ms)
+
     def _on_gain_changed(self, value):
         """Updates UI label and sends new gain to hardware."""
-        # Calculate actual gain value based on the current camera type
         if self.camera_controller.camera_type == 'CV':
             actual_gain = float(value)
             self.gain_val_label.setText(f"{int(actual_gain)}")
+        elif self.camera_controller.camera_type == 'LUC':
+            # LuCam gain: slider is x10, actual is a multiplier (e.g. 1.0x ~ 8.0x)
+            actual_gain = value / 10.0
+            self.gain_val_label.setText(f"{actual_gain:.1f}x")
         else:
+            # VMB: dB scale
             actual_gain = value / 10.0
             self.gain_val_label.setText(f"{actual_gain:.1f}")
             
         self.camera_controller.set_gain(actual_gain)
 
-    def _on_connection_result(self, success, message, stage_obj):
-        """
-        Slot function to handle the outcome of the motor connection thread.
-        Updates the 3 separate display lines: Status, Position, and Velocity.
-        """
-        if success:
-            # Transfer the connected stage object to the main GUI instance
-            self.stage = stage_obj
-            
-            # Fetch actual hardware status right after connecting
-            actual_pos = self.stage.get_position()
-            actual_vel = self.stage.get_current_velocity()
-            
-            # 1. Status
-            #self.status_display.setText(f"Status: Connected (SN: {self.stage.sn})")
-            self.status_display.setText("Status: Connected")
-            self.status_display.setStyleSheet("font-size: 16px; font-weight: bold; color: green;")
-            
-            # 2. Position
-            self.pos_display.setText(f"Current Position: {actual_pos:.3f} mm")
-            self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: blue;")
-            
-            # 3. Velocity
-            self.vel_display.setText(f"Current Velocity: {actual_vel:.3f} mm/s")
-            self.vel_display.setStyleSheet("font-size: 16px; font-weight: bold; color: blue;")
-            
-            # Sync the UI input SpinBox with the actual hardware velocity
-            # so the user sees the real value in the input box too
-            self.vel_input.setValue(actual_vel)
-            
-            # Show popup
-            QMessageBox.information(self, "Connection Success", f"Successfully connected to Motor SN: {self.stage.sn}")
-            
-            # Enable hardware interaction buttons
-            self.btn_move.setEnabled(True)
-            self.btn_home.setEnabled(True)
-            self.btn_stop.setEnabled(True)
-            self.btn_set_vel.setEnabled(True)
-            
-            # Update the Toggle Button to 'Disconnect' mode
-            self.btn_toggle_conn.setText("Disconnect")
-            self.btn_toggle_conn.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
-            
-            if hasattr(self, 'disconnect_action'):
-                self.disconnect_action.setEnabled(True)
-                
-        else:
-            # Handle failure: Update all 3 lines to show error state
-            QMessageBox.critical(self, "Connection Error", f"Failed to connect to Motor:\n{message}")
-            
-            self.status_display.setText("Status: Connection Failed")
-            self.status_display.setStyleSheet("font-size: 16px; font-weight: bold; color: red;")
-            
-            self.pos_display.setText("Current Position: -- mm")
-            self.vel_display.setText("Current Velocity: -- mm/s")
-    def _set_velocity_clicked(self):
-        """
-        Slot function triggered when the 'Set Velocity' button is clicked.
-        Applies the velocity to the hardware and reads it back for verification.
-        """
-        if not self.stage:
-            return
-            
-        target_vel = self.vel_input.value()
-        
-        # 1. Send the velocity command to the hardware
-        success = self.stage.set_velocity(target_vel)
-        
-        if success:
-            # 2. Read back the actual velocity from hardware registers
-            actual_vel = self.stage.get_current_velocity()
-            
-            # 3. Update the Velocity Display to show the verified value
-            self.vel_display.setText(f"Current Velocity: {actual_vel:.3f} mm/s")
-            self.vel_display.setStyleSheet("font-size: 14px; font-weight: bold; color: green;")
-            
-            # 4. Save the new default velocity to config.py
-            import utils
-            import config
-            utils.update_config_file(config.SERIAL_NUMBER, config.STAGE_MODEL, new_velocity=actual_vel)
-            
-            QMessageBox.information(self, "Velocity Set", f"Velocity successfully set to {actual_vel:.3f} mm/s")
-        else:
-            QMessageBox.critical(self, "Error", "Failed to set velocity in hardware.")
-        
-    def _start_homing(self):
-        """Initiates the homing process in a background thread."""
-        if not self.stage:
-            return
-
-        self.btn_home.setEnabled(False)
-        self.btn_move.setEnabled(False)
-        self.status_display.setText("Status: Homing...")
-        self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: orange;")
-        
-        self.home_worker = HomeThread(self.stage)
-        self.home_worker.finished.connect(self._on_homing_finished)
-
-        self.home_worker.status_update.connect(lambda s: self.pos_display.setText(s))
-        
-        self.home_worker.start()
-
-    def _on_homing_finished(self, success, message):
-        """Called when the homing thread finishes."""
-        if success:
-            QMessageBox.information(self, "Homing", "Device successfully homed at 0.000 mm!")
-            self.pos_display.setText("Current Position: 0.000 mm")
-            self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: blue;")
-        else:
-            QMessageBox.critical(self, "Homing Error", f"Homing failed:\n{message}")
-            self.pos_display.setText("Status: Home Failed")
-            self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: red;")
-
-
-        self.btn_home.setEnabled(True)
-        self.btn_move.setEnabled(True)
-        self.btn_stop.setEnabled(True)
-        
-    def _start_moving_absolute(self):
-        self._execute_movement(self.target_input.value(), 'abs')
-
-    def _start_moving_relative(self):       
-        self._execute_movement(self.rel_input.value(), 'rel')
-
-    def _execute_movement(self, value, mode):
-        if not self.stage:
-            return
-
-
-        # 2. Update the Status Display to indicate movement
-        self.status_display.setText("Status: Moving...")
-        self.status_display.setStyleSheet("font-size: 14px; font-weight: bold; color: orange;")
-
-        # 3. Lock UI buttons to prevent user interference during motion
-        self.btn_move.setEnabled(False)
-        self.btn_home.setEnabled(False)
-        self.btn_set_vel.setEnabled(False) # Prevent setting velocity while moving
-        self.btn_set_vel.setEnabled(False)
-
-        # 4. Start the background thread for movement
-        self.move_worker = MoveThread(self.stage, value, mode)
-        self.move_worker.pos_update.connect(self._update_pos_ui)
-        self.move_worker.finished.connect(self._on_move_finished)
-        self.move_worker.start()
-
-
-    def _update_pos_ui(self, pos):
-        """Updates the position display on the UI in real-time."""
-        self.pos_display.setText(f"Current Position: {pos:.3f} mm")
-
-    def _on_move_finished(self, success, message):
-        """Cleanup and UI reset after movement finishes."""
-        self.btn_move.setEnabled(True)
-        self.btn_home.setEnabled(True)
-        self.btn_set_vel.setEnabled(True)
-        
-        if success:
-            
-            #self.status_display.setText(f"Status: Idle (SN: {self.stage.sn})")
-            self.status_display.setText("Status: Idle")
-            self.status_display.setStyleSheet("font-size: 16px; font-weight: bold; color: green;")
-
-            self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: blue;")
-        else:
-            # Execution reaches here only if stopped or an error occurred
-            self.status_display.setText("Status: Movement Interrupted")
-            self.status_display.setStyleSheet("font-size: 16px; font-weight: bold; color: red;")
-            self.pos_display.setStyleSheet("font-size: 16px; font-weight: bold; color: red;")
-
     # --- Emergency Stop Logic ---
     def _emergency_stop(self):
-        """The ultimate stop command (Dual-layer protection)."""
+        """Stop BOTH motors immediately."""
         print("!!! EMERGENCY STOP TRIGGERED !!!")
-        
-        # Layer 1: Send electrical stop command directly to hardware (Highest priority)
-        if hasattr(self, 'stage') and self.stage is not None:
-            self.stage.stop_immediate()
-
-        # Layer 2: Forcefully break the monitoring loops of any running background threads
-        if hasattr(self, 'move_worker') and self.move_worker.isRunning():
-            self.move_worker.request_stop()
-            
-        if hasattr(self, 'home_worker') and self.home_worker.isRunning():
-            # A blunt but effective way to kill a thread if it doesn't have a request_stop method
-            self.home_worker.request_stop()
-        if self.stage:
-            self._update_pos_ui(self.stage.get_position())
-        # Update UI warnings
-        self.status_display.setText("Status: ABORTED BY E-STOP")
-        self.status_display.setStyleSheet("background-color: red; color: white; font-size: 16px; font-weight: bold; padding: 2px;")
+        if hasattr(self, 'motor1'):
+            self.motor1.stop_now()
+        if hasattr(self, 'motor2'):
+            self.motor2.stop_now()
         QMessageBox.warning(self, "E-STOP", "All motion halted!")
         
     # =============================================================================

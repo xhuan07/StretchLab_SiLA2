@@ -12,12 +12,17 @@ class ConnectThread(QThread):
     """Background thread for connecting hardware to prevent GUI freezing."""
     finished = pyqtSignal(bool, str, object)
 
-    def __init__(self, sn, stage_model="MTS50-Z8"):
+    def __init__(self, sn="", stage_model="MTS50-Z8", host=None, port=None):
         super().__init__()
+        self.host = host
+        self.port = port
 
     def run(self):
         try:
-            stage = StageController()
+            if self.host is not None and self.port is not None:
+                stage = StageController(host=self.host, port=self.port)
+            else:
+                stage = StageController()
             success, msg = stage.connect()  
             if success:
                 self.finished.emit(True, msg, stage)
