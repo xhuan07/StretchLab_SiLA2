@@ -1,6 +1,8 @@
 {
-    "motor_host": "192.168.10.2",
-    "motor_port": 50052,
+    "motor1_host": "192.168.10.2",
+    "motor1_port": 50051,
+    "motor2_host": "192.168.10.2",
+    "motor2_port": 50052,
     "dmm_host": "192.168.10.2",
     "dmm_port": 50053
 }
